@@ -36,6 +36,12 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type LogEntry struct {
+	Index   int         // Index in the log
+	Term    int         // Term when entry was received by the leader
+	Command interface{} // Client command
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -44,16 +50,24 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	// Persistent state on all servers
+	CurrentTerm int // Latest term server has seen
+	VotedFor    int // CandidateId that received vote in current term
+	Log         []LogEntry
 
+	// Volatile state on all servers
+	commitIndex   int
+	lastApplied   int
+	electionAlarm time.Time // Election timeout that starts an election
+
+	// Volatile state on leaders, re-initialized after elections
+	nextIndex  []int // Next log index to send to each server
+	matchIndex []int // Highest index known to be replicated on each server
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	// Your code here (2A).
@@ -98,16 +112,18 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
+// RequestVote RPC arguments structure.
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
+	Term         int // Candidate term
+	CandidateId  int
+	LastLogIndex int // Last index in the candidate's log
+	LastLogTerm  int // Last term in the candidate's log
 }
 
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
+// RequestVote RPC reply structure.
 type RequestVoteReply struct {
-	// Your data here (2A).
+	Term        int  // Current term, in case the candidate needs to update itself
+	voteGranted bool // Received vote for election if true
 }
 
 // example RequestVote RPC handler.
