@@ -226,14 +226,29 @@ func (rf *Raft) ticker() {
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
+func Make(
+	peers []*labrpc.ClientEnd,
+	me int,
+	persister *Persister,
+	applyCh chan ApplyMsg,
+) *Raft {
+	rf := &Raft{
+		peers:     peers,
+		me:        me,
+		persister: persister,
+		dead:      0,
 
-	// Your initialization code here (2A, 2B, 2C).
+		CurrentTerm: 0,
+		VotedFor:    nil,
+		Log:         []LogEntry{{Index: 0, Term: 0}},
+
+		commitIndex:   0,
+		lastApplied:   0,
+		electionAlarm: initElectionAlarm(),
+
+		nextIndex: nil,
+		matchIndex, nil,
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
