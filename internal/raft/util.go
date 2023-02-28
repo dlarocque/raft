@@ -1,13 +1,31 @@
 package raft
 
-import "log"
+import (
+	"log"
+	"math/rand"
+	"time"
+)
 
-// Debugging
-const Debug = false
+const (
+	// Server states
+	Leader    state = "Leader"
+	Candidate state = "Candidate"
+	Follower  state = "Follower"
 
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
-	}
-	return
+	// Null votes
+	nullVote = -1
+
+	// Times (milliseconds)
+	minElectionTimeout = 1000
+	maxElectionTimeout = 1500
+)
+
+type state string
+
+// Return a randomly initialized election time
+func initElectionAlarm() time.Time {
+	ms := minElectionTimeout + (rand.Int63() % (maxElectionTimeout - minElectionTimeout))
+	log.Printf("electionTimer ms: %d", ms)
+	timer := time.Now().Add(time.Duration(ms) * time.Millisecond)
+	return timer
 }
