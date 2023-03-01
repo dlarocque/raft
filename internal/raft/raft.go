@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"math/rand"
 	"raft/internal/rpc"
 	"sync"
 	"sync/atomic"
@@ -69,48 +68,9 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
-}
-
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-// before you've implemented snapshots, you should pass nil as the
-// second argument to persister.Save().
-// after you've implemented snapshots, pass the current snapshot
-// (or nil if there's not yet a snapshot).
-func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
-}
-
-// restore previously persisted state.
-func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
-	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.CurrentTerm, rf.state == Leader
 }
 
 // RequestVote RPC arguments structure.
@@ -125,34 +85,6 @@ type RequestVoteArgs struct {
 type RequestVoteReply struct {
 	Term        int  // Current term, in case the candidate needs to update itself
 	VoteGranted bool // Received vote for election if true
-}
-
-// Returns whether the log with lastLogIndex and lastLogTerm is more up to
-// date than our log.
-// Assumes the mutex is held.
-func (rf *Raft) logIsMoreUpToDate(lastLogIndex, lastLogTerm int) bool {
-	// The other log is more up to date if its last log entry term is greater
-	// than our last log entry term.
-	lastLogEntry := rf.Log[len(rf.Log)-1]
-	if lastLogEntry.Term > lastLogTerm {
-		return false
-	} else if lastLogEntry.Term < lastLogTerm {
-		return true
-	}
-
-	// If the last log entry terms are equal, the last log entry
-	// with the highest index belongs to the log that is the most up to date
-	return lastLogEntry.Index <= lastLogIndex
-
-}
-
-// Transition to the follower state, and enter the most recent term.
-func (rf *Raft) convertToFollower(term int) {
-	rf.CurrentTerm = term
-	rf.state = Follower
-	rf.VotedFor = nullVote
-	rf.nextIndex = nil
-	rf.matchIndex = nil
 }
 
 // RequestVote RPC handler.
@@ -285,7 +217,7 @@ func (rf *Raft) tallyVotes(term int, pollingStation <-chan bool) {
 	// we need to validate all assumptions about our state
 	Debug(rf, dVote, "VC: %d", voteCount)
 	if (rf.state == Candidate && rf.CurrentTerm == term) &&
-		voteCount > len(rf.peers)/2 {
+		voteCount >= (len(rf.peers)/2)+1 {
 		Debug(rf, dVote, "Transition to leader for T:%d", rf.CurrentTerm)
 		// If we have received votes from a majority of servers, become leader
 		// Win the election
@@ -312,7 +244,7 @@ func (rf *Raft) tallyVotes(term int, pollingStation <-chan bool) {
 		rf.mu.Unlock()
 
 		// Start the pacemaker
-		go rf.pacemaker()
+		go rf.pacemaker(term)
 		// There is no need to convert to follower, since we have lost the
 		// election, and the leader will convert us to the follower state
 		// by sending a heartbeat.
@@ -321,14 +253,133 @@ func (rf *Raft) tallyVotes(term int, pollingStation <-chan bool) {
 	}
 }
 
-// Periodically send heartbeats to all peers
-func (rf *Raft) pacemaker() {
-	for rf.killed() == false { // Make sure this doesn't keep running
-		// Tests restrict sending heartbeats more than 10 times per second
-
-		ms := 100 + (rand.Int63() % 100) // 100ms-200ms
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+// Returns whether the log with lastLogIndex and lastLogTerm is more up to
+// date than our log.
+// Assumes the mutex is held.
+func (rf *Raft) logIsMoreUpToDate(lastLogIndex, lastLogTerm int) bool {
+	// The other log is more up to date if its last log entry term is greater
+	// than our last log entry term.
+	lastLogEntry := rf.Log[len(rf.Log)-1]
+	if lastLogEntry.Term > lastLogTerm {
+		return false
+	} else if lastLogEntry.Term < lastLogTerm {
+		return true
 	}
+
+	// If the last log entry terms are equal, the last log entry
+	// with the highest index belongs to the log that is the most up to date
+	return lastLogEntry.Index <= lastLogIndex
+
+}
+
+// Transition to the follower state, and enter the most recent term.
+func (rf *Raft) convertToFollower(term int) {
+	rf.CurrentTerm = term
+	rf.state = Follower
+	rf.VotedFor = nullVote
+	rf.nextIndex = nil
+	rf.matchIndex = nil
+}
+
+// Periodically send heartbeats to all peers
+func (rf *Raft) pacemaker(term int) {
+	for rf.killed() == false { // Make sure this doesn't keep running
+		rf.mu.Lock()
+
+		// Validate assumptions
+		if rf.state == Leader && rf.CurrentTerm == term {
+			// Send heartbeats to all peers to reset their election timers
+			rf.mu.Unlock()
+			Debug(rf, dLeader, "pacemaker sending heartbeats, T:%d", term)
+			for i := range rf.peers {
+				if i != rf.me {
+					rf.appendEntries(i, term)
+				}
+			}
+
+			// Tests restrict sending heartbeats more than 10 times per second
+			Debug(rf, dTimer, "pacemaker going to sleep for %dms", 150)
+			time.Sleep(150 * time.Millisecond)
+		} else {
+			rf.mu.Unlock()
+		}
+	}
+}
+
+func (rf *Raft) sendHeartbeat() {
+
+}
+
+type AppendEntriesArgs struct {
+	Term         int        // Leader's term
+	LeaderId     int        // Use so that followers can redirect clients
+	PrevLogIndex int        // Index of log entry immediately preceeding new ones
+	PrevLogTerm  int        // Term of log entry immediately preceeding new ones
+	Entries      []LogEntry // Log entries to store
+	LeaderCommit int        // Leader's commitIndex
+}
+
+type AppendEntriesReply struct {
+	Term    int  // Current term, in case the leader needs to update itself
+	Success bool // True if follower contained an entry matching log entry and index
+}
+
+// goroutine
+func (rf *Raft) appendEntries(server int, term int) {
+	// Construct request
+	rf.mu.Lock()
+	// Validate state
+	if rf.state != Leader || rf.CurrentTerm != term {
+		return
+	}
+	prevLogIndex := rf.nextIndex[server] - 1
+	args := &AppendEntriesArgs{
+		Term:         rf.CurrentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  rf.Log[prevLogIndex].Term,
+		Entries:      []LogEntry{},
+		LeaderCommit: 0, // TODO
+	}
+	rf.mu.Unlock()
+
+	reply := &RequestVoteReply{}
+	ok := rf.sendAppendEntries(server, args, reply)
+	if ok {
+		rf.mu.Lock()
+		// Our state may have been updated since we send the append entries RPC
+		// so we have to validate our state
+		if rf.state == Leader && rf.CurrentTerm == args.Term {
+			Debug(rf, dLeader, "-> S:%d, Sent Append Entries, T:%d", server, rf.CurrentTerm)
+		}
+
+		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) sendAppendEntries(
+	server int,
+	args *AppendEntriesArgs,
+	reply *RequestVoteReply,
+) bool {
+	Debug(rf, dVote, "-> S:%d, Sending Heartbeat for T:%d", server, args.Term)
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+// Append Entries RPC handler
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Term = rf.CurrentTerm
+	reply.Success = false
+	if rf.CurrentTerm > args.Term {
+		// Ignore append entries from leaders from previous terms
+		return
+	}
+
+	Debug(rf, dTimer, "Resetting ELA for T:%d", args.Term)
+	rf.electionAlarm = initElectionAlarm()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -376,7 +427,7 @@ func (rf *Raft) ticker() {
 	var sleepDuration time.Duration
 	for rf.killed() == false {
 		rf.mu.Lock()
-		if rf.state == Follower {
+		if rf.state == Follower || rf.state == Candidate {
 			Debug(rf, dTimer, "Follower checking election timeout")
 			// Check if a leader election should be started
 			if rf.electionAlarm.After(time.Now()) {
@@ -474,4 +525,42 @@ func Make(
 	go rf.ticker()
 
 	return rf
+}
+
+// save Raft's persistent state to stable storage,
+// where it can later be retrieved after a crash and restart.
+// see paper's Figure 2 for a description of what should be persistent.
+// before you've implemented snapshots, you should pass nil as the
+// second argument to persister.Save().
+// after you've implemented snapshots, pass the current snapshot
+// (or nil if there's not yet a snapshot).
+func (rf *Raft) persist() {
+	// Your code here (2C).
+	// Example:
+	// w := new(bytes.Buffer)
+	// e := gob.NewEncoder(w)
+	// e.Encode(rf.xxx)
+	// e.Encode(rf.yyy)
+	// raftstate := w.Bytes()
+	// rf.persister.Save(raftstate, nil)
+}
+
+// restore previously persisted state.
+func (rf *Raft) readPersist(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	// Your code here (2C).
+	// Example:
+	// r := bytes.NewBuffer(data)
+	// d := gob.NewDecoder(r)
+	// var xxx
+	// var yyy
+	// if d.Decode(&xxx) != nil ||
+	//    d.Decode(&yyy) != nil {
+	//   error...
+	// } else {
+	//   rf.xxx = xxx
+	//   rf.yyy = yyy
+	// }
 }
