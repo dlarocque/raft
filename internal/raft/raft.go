@@ -198,6 +198,7 @@ func (rf *Raft) sendRequestVote(
 
 func (rf *Raft) tallyVotes(term int, pollingStation <-chan bool) {
 	voteCount := 1
+	done := false
 
 	Debug(rf, dVote, "Collecting votes from all peers")
 	// Collect votes from all the peers
@@ -208,48 +209,47 @@ func (rf *Raft) tallyVotes(term int, pollingStation <-chan bool) {
 				voteCount += 1
 			}
 		}
-	}
-	Debug(rf, dVote, "Collected all votes")
 
-	rf.mu.Lock()
+		if !done && voteCount >= (len(rf.peers)/2)+1 {
+			rf.mu.Lock()
+			done = true
 
-	// State may have been modified since we last released the lock, so
-	// we need to validate all assumptions about our state
-	Debug(rf, dVote, "VC: %d", voteCount)
-	if (rf.state == Candidate && rf.CurrentTerm == term) &&
-		voteCount >= (len(rf.peers)/2)+1 {
-		Debug(rf, dVote, "Transition to leader for T:%d", rf.CurrentTerm)
-		// If we have received votes from a majority of servers, become leader
-		// Win the election
-		// Update the volatile leader state
-		rf.state = Leader
+			Debug(rf, dVote, "VC: %d", voteCount)
+			if rf.state == Candidate && rf.CurrentTerm == term {
+				Debug(rf, dVote, "Transition to leader for T:%d", rf.CurrentTerm)
+				// If we have received votes from a majority of servers, become leader
+				// Win the election
+				// Update the volatile leader state
+				rf.state = Leader
 
-		lastLogEntry := rf.Log[len(rf.Log)-1]
-		rf.nextIndex = make([]int, len(rf.peers))
-		for i := range rf.nextIndex {
-			rf.nextIndex[i] = lastLogEntry.Index + 1
-		}
+				lastLogEntry := rf.Log[len(rf.Log)-1]
+				rf.nextIndex = make([]int, len(rf.peers))
+				for i := range rf.nextIndex {
+					rf.nextIndex[i] = lastLogEntry.Index + 1
+				}
 
-		rf.matchIndex = make([]int, len(rf.peers))
-		for i := range rf.matchIndex {
-			// We only know the last replicated log index on
-			// our own server
-			if i == rf.me {
-				rf.matchIndex[i] = lastLogEntry.Index
+				rf.matchIndex = make([]int, len(rf.peers))
+				for i := range rf.matchIndex {
+					// We only know the last replicated log index on
+					// our own server
+					if i == rf.me {
+						rf.matchIndex[i] = lastLogEntry.Index
+					} else {
+						rf.matchIndex[i] = 0
+					}
+				}
+
+				term := rf.CurrentTerm
+				rf.mu.Unlock()
+				go rf.pacemaker(term)
+				// There is no need to convert to follower, since we have lost the
+				// election, and the leader will convert us to the follower state
+				// by sending a heartbeat.
+
 			} else {
-				rf.matchIndex[i] = 0
+				rf.mu.Unlock()
 			}
 		}
-
-		rf.mu.Unlock()
-
-		// Start the pacemaker
-		go rf.pacemaker(term)
-		// There is no need to convert to follower, since we have lost the
-		// election, and the leader will convert us to the follower state
-		// by sending a heartbeat.
-	} else {
-		rf.mu.Unlock()
 	}
 }
 
@@ -347,10 +347,9 @@ func (rf *Raft) appendEntries(server int, term int) {
 	ok := rf.sendAppendEntries(server, args, reply)
 	if ok {
 		rf.mu.Lock()
-		// Our state may have been updated since we send the append entries RPC
-		// so we have to validate our state
-		if rf.state == Leader && rf.CurrentTerm == args.Term {
-			Debug(rf, dLeader, "-> S:%d, Sent Append Entries, T:%d", server, rf.CurrentTerm)
+
+		if reply.Term > rf.CurrentTerm {
+			rf.convertToFollower(reply.Term)
 		}
 
 		rf.mu.Unlock()
@@ -371,11 +370,20 @@ func (rf *Raft) sendAppendEntries(
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	reply.Term = rf.CurrentTerm
 	reply.Success = false
+
 	if rf.CurrentTerm > args.Term {
 		// Ignore append entries from leaders from previous terms
 		return
+	}
+
+	// If Append Entries received from server with term greater than ours convert to follower.
+	// In the case that we're a candidate and recieve an Append Entries from another server,
+	// we should step down if it's term is at least as big as ours, since it should win the election.
+	if (args.Term > rf.CurrentTerm) || (rf.state == Candidate && args.Term >= rf.CurrentTerm) {
+		rf.convertToFollower(args.Term)
 	}
 
 	Debug(rf, dTimer, "Resetting ELA for T:%d", args.Term)
@@ -431,7 +439,6 @@ func (rf *Raft) ticker() {
 			Debug(rf, dTimer, "Follower checking election timeout")
 			// Check if a leader election should be started
 			if rf.electionAlarm.After(time.Now()) {
-				// sleepDuration = time.Duration(50 + (rand.Int63() % 300))
 				sleepDuration = time.Until(rf.electionAlarm)
 				rf.mu.Unlock()
 			} else {
