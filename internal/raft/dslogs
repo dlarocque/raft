@@ -1,4 +1,4 @@
-#!/opt/homebrew/bin/python3
+#!/usr/bin/python3
 # ref: https://blog.josejg.com/debugging-pretty/
 # source: https://gist.github.com/JJGO/e64c0e8aedb5d464b5f79d3b12197338
 
@@ -87,6 +87,7 @@ def main(
             # as peer id
             if topic not in NO_COLUMN_TOPICS:
                 i = int(msg[1])
+                # print("i:", i)
 
             # Colorize output by using rich syntax when needed
             if colorize and topic in TOPICS:
@@ -105,9 +106,11 @@ def main(
                 col_width = int(width / n_columns)
                 cols = Columns(cols, width=col_width - 1, equal=True, expand=True)
                 print(cols)
-        except:
-            # Code from tests or panics does not follow format
-            # so we print it as is
+        except Exception as e:
+            print("unexpected format:", line)
+            print("exception: ", e)
+            print("cols: ", cols)
+            return
             if line.startswith("panic"):
                 panic = True
             # Output from tests is usually important so add a

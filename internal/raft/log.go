@@ -43,9 +43,9 @@ func init() {
 
 func Debug(rf *Raft, topic logTopic, format string, a ...interface{}) {
 	if debugVerbosity >= 1 {
-		time := time.Since(debugStart).Milliseconds()
+		time := time.Since(debugStart).Microseconds()
 		time /= 100
-		prefix := fmt.Sprintf("%06d %v %d ", time, string(topic), rf.me)
+		prefix := fmt.Sprintf("%06d %v S%d ", time, string(topic), rf.me)
 		format = prefix + format
 		log.Printf(format, a...)
 	}
