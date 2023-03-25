@@ -116,8 +116,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// If votedFor is null or candidateId, and candidate's log is at least as
 	// up to date as receiver's log, grant a vote
-	if (rf.VotedFor == nullVote || rf.VotedFor == args.CandidateId) &&
-		rf.logIsMoreUpToDate(args.LastLogIndex, args.LastLogTerm) {
+	if rf.VotedFor == nullVote || rf.VotedFor == args.CandidateId {
 		Debug(rf, dVote, "<- S:%d sent vote", args.CandidateId)
 		reply.VoteGranted = true
 		rf.VotedFor = args.CandidateId
@@ -208,14 +207,14 @@ func (rf *Raft) tallyVotes(term int, pollingStation <-chan bool) {
 	for i := range rf.peers {
 		if i != rf.me {
 			vote := <-pollingStation
-			if vote == true {
+			if vote {
 				voteCount += 1
 			}
 		}
 
 		if !done && voteCount >= (len(rf.peers)/2)+1 {
-			rf.mu.Lock()
 			done = true
+			rf.mu.Lock()
 
 			Debug(rf, dVote, "VC: %d", voteCount)
 			if rf.state == Candidate && rf.CurrentTerm == term {
@@ -244,6 +243,8 @@ func (rf *Raft) tallyVotes(term int, pollingStation <-chan bool) {
 
 				term := rf.CurrentTerm
 				rf.mu.Unlock()
+				// Upon election, send heartbeats to each server to prevent election timeouts,
+				// and repeat during idle periods
 				go rf.pacemaker(term)
 				// There is no need to convert to follower, since we have lost the
 				// election, and the leader will convert us to the follower state
@@ -286,17 +287,17 @@ func (rf *Raft) convertToFollower(term int) {
 
 // Periodically send heartbeats to all peers
 func (rf *Raft) pacemaker(term int) {
-	for rf.killed() == false { // Make sure this doesn't keep running
+	for !rf.killed() { // Make sure this doesn't keep running
 		rf.mu.Lock()
 
-		// Validate assumptions
+		// Validate that we are still the leader for the current term
 		if rf.state == Leader && rf.CurrentTerm == term {
 			// Send heartbeats to all peers to reset their election timers
 			rf.mu.Unlock()
 			Debug(rf, dLeader, "pacemaker sending heartbeats, T:%d", term)
 			for i := range rf.peers {
 				if i != rf.me {
-					rf.appendEntries(i, term)
+					go rf.appendEntries(i, term)
 				}
 			}
 
