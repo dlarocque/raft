@@ -91,7 +91,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	Debug(rf, dVote, "Received RequestVote from S:%d", args.CandidateId)
+	Debug(rf, dVote, "Received RequestVote from S%d", args.CandidateId)
 
 	reply.Term = rf.CurrentTerm
 	reply.VoteGranted = false
@@ -104,25 +104,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// allowing us to grant the vote that we previously gave ourselves to
 	// another candidate.
 	if args.Term > rf.CurrentTerm {
-		Debug(rf, dVote, "<- S:%d has lower term (%d < %d), converting to follower", args.CandidateId, args.Term, rf.CurrentTerm)
+		Debug(rf, dVote, "<- S%d has lower term (%d < %d), converting to follower", args.CandidateId, args.Term, rf.CurrentTerm)
 		rf.convertToFollower(args.Term)
 	}
 
 	// Reply false if term < currentTerm
 	if args.Term < rf.CurrentTerm || args.CandidateId == rf.me {
-		Debug(rf, dVote, "<- S:%d has a more recent term (%d < %d)", args.CandidateId, args.Term, rf.CurrentTerm)
+		Debug(rf, dVote, "<- S%d has a more recent term (%d < %d)", args.CandidateId, args.Term, rf.CurrentTerm)
 		return
 	}
 
 	// If votedFor is null or candidateId, and candidate's log is at least as
 	// up to date as receiver's log, grant a vote
 	if rf.VotedFor == nullVote || rf.VotedFor == args.CandidateId {
-		Debug(rf, dVote, "<- S:%d sent vote", args.CandidateId)
+		Debug(rf, dVote, "<- S%d sent vote", args.CandidateId)
 		reply.VoteGranted = true
 		rf.VotedFor = args.CandidateId
 		// Reset election timer when we grand our vote to a peer
-		Debug(rf, dVote, "<- S:%d reset election time", args.CandidateId)
-		// rf.electionAlarm = initElectionAlarm()
+		Debug(rf, dVote, "<- S%d reset election time", args.CandidateId)
+		rf.electionAlarm = initElectionAlarm()
 	}
 }
 
@@ -145,11 +145,13 @@ func (rf *Raft) requestVote(
 			// to date, we transition to the follower state, and we will update
 			// our term to that logs latest term.
 			if reply.Term > rf.CurrentTerm {
-				Debug(rf, dTerm, "Requested Vote from S:%d with T:%d (> T:%d), converting to follower", server, reply.Term, rf.CurrentTerm)
+				Debug(rf, dTerm, "Requested Vote from S%d with %d (> T%d), converting to follower", server, reply.Term, rf.CurrentTerm)
 				rf.convertToFollower(reply.Term)
 			} else {
-				Debug(rf, dVote, "Received vote from S:%d", server)
 				vote = reply.VoteGranted
+				if vote {
+					Debug(rf, dVote, "Granted vote to S%d for T%d", args.CandidateId, args.Term)
+				}
 			}
 		}
 
@@ -204,21 +206,22 @@ func (rf *Raft) tallyVotes(term int, pollingStation <-chan bool) {
 
 	Debug(rf, dVote, "Collecting votes from all peers")
 	// Collect votes from all the peers
-	for i := range rf.peers {
-		if i != rf.me {
-			vote := <-pollingStation
-			if vote {
-				voteCount += 1
-			}
+	for i := 0; i < len(rf.peers)-1; i++ {
+		vote := <-pollingStation
+		if vote {
+			voteCount += 1
 		}
 
-		if !done && voteCount >= (len(rf.peers)/2)+1 {
+		if !done && voteCount >= len(rf.peers)/2+1 {
 			done = true
 			rf.mu.Lock()
 
 			Debug(rf, dVote, "VC: %d", voteCount)
-			if rf.state == Candidate && rf.CurrentTerm == term {
-				Debug(rf, dVote, "Transition to leader for T:%d", rf.CurrentTerm)
+
+			if rf.state != Candidate || rf.CurrentTerm != term {
+				rf.mu.Unlock()
+			} else {
+				Debug(rf, dVote, "Transition to leader for T%d", rf.CurrentTerm)
 				// If we have received votes from a majority of servers, become leader
 				// Win the election
 				// Update the volatile leader state
@@ -246,12 +249,10 @@ func (rf *Raft) tallyVotes(term int, pollingStation <-chan bool) {
 				// Upon election, send heartbeats to each server to prevent election timeouts,
 				// and repeat during idle periods
 				go rf.pacemaker(term)
-				// There is no need to convert to follower, since we have lost the
+				// There is no need to convert to follower, if we have lost the
 				// election, and the leader will convert us to the follower state
 				// by sending a heartbeat.
 
-			} else {
-				rf.mu.Unlock()
 			}
 		}
 	}
@@ -283,6 +284,7 @@ func (rf *Raft) convertToFollower(term int) {
 	rf.VotedFor = nullVote
 	rf.nextIndex = nil
 	rf.matchIndex = nil
+	Debug(rf, dTerm, "converted to follower for T%d", term)
 }
 
 // Periodically send heartbeats to all peers
@@ -294,7 +296,7 @@ func (rf *Raft) pacemaker(term int) {
 		if rf.state == Leader && rf.CurrentTerm == term {
 			// Send heartbeats to all peers to reset their election timers
 			rf.mu.Unlock()
-			Debug(rf, dLeader, "pacemaker sending heartbeats, T:%d", term)
+			Debug(rf, dLeader, "pacemaker sending heartbeats, T%d", term)
 			for i := range rf.peers {
 				if i != rf.me {
 					go rf.appendEntries(i, term)
@@ -302,10 +304,12 @@ func (rf *Raft) pacemaker(term int) {
 			}
 
 			// Tests restrict sending heartbeats more than 10 times per second
-			Debug(rf, dTimer, "pacemaker going to sleep for %dms", 150)
-			time.Sleep(150 * time.Millisecond)
+			Debug(rf, dTimer, "pacemaker going to sleep for %dms", 100)
+			time.Sleep(100 * time.Millisecond)
 		} else {
+			Debug(rf, dLeader, "pacemaker stopped for T%d", term)
 			rf.mu.Unlock()
+			return
 		}
 	}
 }
@@ -330,6 +334,7 @@ func (rf *Raft) appendEntries(server int, term int) {
 	rf.mu.Lock()
 	// Validate state
 	if rf.state != Leader || rf.CurrentTerm != term {
+		rf.mu.Unlock()
 		return
 	}
 	prevLogIndex := rf.nextIndex[server] - 1
@@ -349,6 +354,7 @@ func (rf *Raft) appendEntries(server int, term int) {
 		rf.mu.Lock()
 
 		if reply.Term > rf.CurrentTerm {
+			Debug(rf, dTerm, "<- S%d at T%d is more up to date", server, reply.Term)
 			rf.convertToFollower(reply.Term)
 		}
 
@@ -361,7 +367,7 @@ func (rf *Raft) sendAppendEntries(
 	args *AppendEntriesArgs,
 	reply *RequestVoteReply,
 ) bool {
-	Debug(rf, dLeader, "-> S:%d, Sending Heartbeat for T:%d", server, args.Term)
+	Debug(rf, dLog2, "-> S%d, Sending Heartbeat for T%d", server, args.Term)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -370,6 +376,8 @@ func (rf *Raft) sendAppendEntries(
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	Debug(rf, dLog, "<- S%d: T%d Received AppendEntries", args.LeaderId, args.Term)
 
 	reply.Term = rf.CurrentTerm
 	reply.Success = false
@@ -380,6 +388,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 1. Reply false if term < currentTerm
 	if args.Term < rf.CurrentTerm {
+		Debug(rf, dLog, "<- S%d: T%d < T%d, replying false since we are more up to date", args.LeaderId, args.Term, rf.CurrentTerm)
 		return
 	}
 
@@ -395,6 +404,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// If Append Entries received from server with term greater than ours, convert to follower.
 	if args.Term > rf.CurrentTerm {
+		Debug(rf, dLog, "T%d < T%d, converting to follower for T%d", args.LeaderId, args.Term, rf.CurrentTerm, args.Term)
 		rf.convertToFollower(args.Term)
 	}
 
@@ -404,13 +414,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// *** What happens if there are two candidates, who both simultaneously step down?
 	// *** A: They will both have randomly set election timers again, and will start another election,
 	// *** where hopefully that will not occur again.
-	if rf.state == Candidate && args.Term >= rf.CurrentTerm {
-		rf.convertToFollower(args.Term)
-	}
+	//if rf.state == Candidate && args.Term >= rf.CurrentTerm {
+	//	rf.convertToFollower(args.Term)
+	//}
 
 	// Since this AppendEntries RPC comes from the current leader, we want to reset our
 	// election alarm.
-	Debug(rf, dTimer, "Resetting ELA for T:%d", args.Term)
+	Debug(rf, dTimer, "Resetting ELA for T%d", args.Term)
 	rf.electionAlarm = initElectionAlarm()
 }
 
@@ -457,7 +467,7 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) ticker() {
 	var sleepDuration time.Duration
-	for rf.killed() == false {
+	for !rf.killed() {
 		rf.mu.Lock()
 		if rf.state == Follower || rf.state == Candidate {
 			Debug(rf, dTimer, "Follower checking election timeout")
@@ -466,7 +476,7 @@ func (rf *Raft) ticker() {
 				sleepDuration = time.Until(rf.electionAlarm)
 				rf.mu.Unlock()
 			} else {
-				Debug(rf, dTimer, "Election timeout has expired, follower converting to candidate, calling election for term %d", rf.CurrentTerm+1)
+				Debug(rf, dTimer, "Election timeout has expired, follower converting to candidate, calling election for T%d", rf.CurrentTerm+1)
 				// Convert to candidate
 				// On conversion to candidate, start an election:
 				// 1. Increment current term
@@ -546,7 +556,7 @@ func Make(
 		matchIndex: nil,
 	}
 
-	Debug(rf, dClient, "Started at T:%d, ET %d", rf.CurrentTerm, rf.electionAlarm.UnixMilli()-time.Now().UnixMilli())
+	Debug(rf, dClient, "Started at T%d, ET %d", rf.CurrentTerm, rf.electionAlarm.UnixMilli()-time.Now().UnixMilli())
 
 	// initialize from state persisted before a crash
 	// rf.readPersist(persister.ReadRaftState())

@@ -111,13 +111,19 @@ func TestManyElections2A(t *testing.T) {
 		cfg.disconnect(i2)
 		cfg.disconnect(i3)
 
+		fmt.Printf("Disconnected servers %d %d %d\n", i1, i2, i3)
+
 		// either the current leader should still be alive,
 		// or the remaining four should elect a new one.
 		cfg.checkOneLeader()
 
+		fmt.Printf("Found leader\n")
+
 		cfg.connect(i1)
 		cfg.connect(i2)
 		cfg.connect(i3)
+
+		fmt.Printf("Connected servers %d %d %d\n", i1, i2, i3)
 	}
 
 	cfg.checkOneLeader()
