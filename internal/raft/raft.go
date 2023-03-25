@@ -65,14 +65,6 @@ type Raft struct {
 	matchIndex []int // Highest index known to be replicated on each server
 }
 
-// return currentTerm and whether this server
-// believes it is the leader.
-func (rf *Raft) GetState() (int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.CurrentTerm, rf.state == Leader
-}
-
 // RequestVote RPC arguments structure.
 type RequestVoteArgs struct {
 	Term         int // Candidate term
@@ -85,6 +77,28 @@ type RequestVoteArgs struct {
 type RequestVoteReply struct {
 	Term        int  // Current term, in case the candidate needs to update itself
 	VoteGranted bool // Received vote for election if true
+}
+
+type AppendEntriesArgs struct {
+	Term         int        // Leader's term
+	LeaderId     int        // Use so that followers can redirect clients
+	PrevLogIndex int        // Index of log entry immediately preceeding new ones
+	PrevLogTerm  int        // Term of log entry immediately preceeding new ones
+	Entries      []LogEntry // Log entries to store
+	LeaderCommit int        // Leader's commitIndex
+}
+
+type AppendEntriesReply struct {
+	Term    int  // Current term, in case the leader needs to update itself
+	Success bool // True if follower contained an entry matching log entry and index
+}
+
+// return currentTerm and whether this server
+// believes it is the leader.
+func (rf *Raft) GetState() (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.CurrentTerm, rf.state == Leader
 }
 
 // RequestVote RPC handler
@@ -314,20 +328,6 @@ func (rf *Raft) pacemaker(term int) {
 	}
 }
 
-type AppendEntriesArgs struct {
-	Term         int        // Leader's term
-	LeaderId     int        // Use so that followers can redirect clients
-	PrevLogIndex int        // Index of log entry immediately preceeding new ones
-	PrevLogTerm  int        // Term of log entry immediately preceeding new ones
-	Entries      []LogEntry // Log entries to store
-	LeaderCommit int        // Leader's commitIndex
-}
-
-type AppendEntriesReply struct {
-	Term    int  // Current term, in case the leader needs to update itself
-	Success bool // True if follower contained an entry matching log entry and index
-}
-
 // goroutine
 func (rf *Raft) appendEntries(server int, term int) {
 	// Construct request
@@ -407,16 +407,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		Debug(rf, dLog, "T%d < T%d, converting to follower for T%d", args.LeaderId, args.Term, rf.CurrentTerm, args.Term)
 		rf.convertToFollower(args.Term)
 	}
-
-	// If we are a candidate and recieve an AppendEntriesRPC from another server,
-	// and the servers term is at least as big as ours, we should step down, since the other server
-	// should win the election.
-	// *** What happens if there are two candidates, who both simultaneously step down?
-	// *** A: They will both have randomly set election timers again, and will start another election,
-	// *** where hopefully that will not occur again.
-	//if rf.state == Candidate && args.Term >= rf.CurrentTerm {
-	//	rf.convertToFollower(args.Term)
-	//}
 
 	// Since this AppendEntries RPC comes from the current leader, we want to reset our
 	// election alarm.
@@ -558,13 +548,14 @@ func Make(
 
 	Debug(rf, dClient, "Started at T%d, ET %d", rf.CurrentTerm, rf.electionAlarm.UnixMilli()-time.Now().UnixMilli())
 
-	// initialize from state persisted before a crash
-	// rf.readPersist(persister.ReadRaftState())
-
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
 	return rf
+}
+
+func (rf *Raft) committer() {
+
 }
 
 // save Raft's persistent state to stable storage,
