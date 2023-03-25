@@ -87,27 +87,31 @@ type RequestVoteReply struct {
 	VoteGranted bool // Received vote for election if true
 }
 
-// RequestVote RPC handler.
+// RequestVote RPC handler
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	Debug(rf, dVote, "Received RequestVote from S:%d", args.CandidateId)
 
+	reply.Term = rf.CurrentTerm
+	reply.VoteGranted = false
+
+	// If RPC request contains term greater than our term, update our
+	// current term, and convert to follower
+	//
+	// If we are currently a candidate running an election,
+	// converting to a follower resets our vote for the new election term,
+	// allowing us to grant the vote that we previously gave ourselves to
+	// another candidate.
+	if args.Term > rf.CurrentTerm {
+		Debug(rf, dVote, "<- S:%d has lower term (%d < %d), converting to follower", args.CandidateId, args.Term, rf.CurrentTerm)
+		rf.convertToFollower(args.Term)
+	}
+
 	// Reply false if term < currentTerm
 	if args.Term < rf.CurrentTerm || args.CandidateId == rf.me {
 		Debug(rf, dVote, "<- S:%d has a more recent term (%d < %d)", args.CandidateId, args.Term, rf.CurrentTerm)
-		reply.Term = rf.CurrentTerm
-		reply.VoteGranted = false
 		return
-	}
-	if args.Term > rf.CurrentTerm {
-		Debug(rf, dVote, "<- S:%d has lower term (%d < %d), converting to follower", args.CandidateId, args.Term, rf.CurrentTerm)
-		// If RPC request contains term greater than our term, update our
-		// current term, and convert to follower
-		rf.convertToFollower(args.Term)
-		// In the case where we are currently a candidate running an election,
-		// we converting to a follower resets our vote for the new election term,
-		// allowing us to grant the vote that we previously gave ourselves.
 	}
 
 	// If votedFor is null or candidateId, and candidate's log is at least as
@@ -115,39 +119,38 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (rf.VotedFor == nullVote || rf.VotedFor == args.CandidateId) &&
 		rf.logIsMoreUpToDate(args.LastLogIndex, args.LastLogTerm) {
 		Debug(rf, dVote, "<- S:%d sent vote", args.CandidateId)
-		reply.Term = args.Term
 		reply.VoteGranted = true
 		rf.VotedFor = args.CandidateId
 		// Reset election timer when we grand our vote to a peer
 		Debug(rf, dVote, "<- S:%d reset election time", args.CandidateId)
-		rf.electionAlarm = initElectionAlarm()
+		// rf.electionAlarm = initElectionAlarm()
 	}
 }
 
 // goroutine
 func (rf *Raft) requestVote(
 	server int,
-	requestVoteArgs *RequestVoteArgs,
+	args *RequestVoteArgs,
 	pollingStation chan<- bool,
 ) {
-	requestVoteReply := &RequestVoteReply{}
-	ok := rf.sendRequestVote(server, requestVoteArgs, requestVoteReply)
+	reply := &RequestVoteReply{}
+	ok := rf.sendRequestVote(server, args, reply)
 	vote := false
 	if ok {
 		rf.mu.Lock()
 
 		// Our state may have been updated by an append entries, or request
 		// vote, so we need to make sure our assumptions on state still hold.
-		if rf.state == Candidate && rf.CurrentTerm == requestVoteArgs.Term {
+		if rf.state == Candidate && rf.CurrentTerm == args.Term {
 			// If we requested a vote from a server with a log that is more up
 			// to date, we transition to the follower state, and we will update
 			// our term to that logs latest term.
-			if requestVoteReply.Term > rf.CurrentTerm {
-				Debug(rf, dTerm, "Requested Vote from S:%d with T:%d (> T:%d), converting to follower", server, requestVoteReply.Term, rf.CurrentTerm)
-				rf.convertToFollower(requestVoteReply.Term)
+			if reply.Term > rf.CurrentTerm {
+				Debug(rf, dTerm, "Requested Vote from S:%d with T:%d (> T:%d), converting to follower", server, reply.Term, rf.CurrentTerm)
+				rf.convertToFollower(reply.Term)
 			} else {
 				Debug(rf, dVote, "Received vote from S:%d", server)
-				vote = requestVoteReply.VoteGranted
+				vote = reply.VoteGranted
 			}
 		}
 
@@ -306,10 +309,6 @@ func (rf *Raft) pacemaker(term int) {
 	}
 }
 
-func (rf *Raft) sendHeartbeat() {
-
-}
-
 type AppendEntriesArgs struct {
 	Term         int        // Leader's term
 	LeaderId     int        // Use so that followers can redirect clients
@@ -361,7 +360,7 @@ func (rf *Raft) sendAppendEntries(
 	args *AppendEntriesArgs,
 	reply *RequestVoteReply,
 ) bool {
-	Debug(rf, dVote, "-> S:%d, Sending Heartbeat for T:%d", server, args.Term)
+	Debug(rf, dLeader, "-> S:%d, Sending Heartbeat for T:%d", server, args.Term)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -374,18 +373,42 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.CurrentTerm
 	reply.Success = false
 
-	if rf.CurrentTerm > args.Term {
-		// Ignore append entries from leaders from previous terms
+	if args.LeaderId == rf.me {
+		panic("Leader sent AppendEntries to self")
+	}
+
+	// 1. Reply false if term < currentTerm
+	if args.Term < rf.CurrentTerm {
 		return
 	}
 
-	// If Append Entries received from server with term greater than ours convert to follower.
-	// In the case that we're a candidate and recieve an Append Entries from another server,
-	// we should step down if it's term is at least as big as ours, since it should win the election.
-	if (args.Term > rf.CurrentTerm) || (rf.state == Candidate && args.Term >= rf.CurrentTerm) {
+	// TODO: 2. Reply false if log doesn't contain an entry at prevLogIndex whose term
+	// matches prevLogTerm
+
+	// TODO: 3. If an existing entry conflicts with a new one, delete the existing entry and
+	// all that follow it.
+
+	// TODO: 4. Append any new entries not already in the log.
+
+	// TODO: 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+
+	// If Append Entries received from server with term greater than ours, convert to follower.
+	if args.Term > rf.CurrentTerm {
 		rf.convertToFollower(args.Term)
 	}
 
+	// If we are a candidate and recieve an AppendEntriesRPC from another server,
+	// and the servers term is at least as big as ours, we should step down, since the other server
+	// should win the election.
+	// *** What happens if there are two candidates, who both simultaneously step down?
+	// *** A: They will both have randomly set election timers again, and will start another election,
+	// *** where hopefully that will not occur again.
+	if rf.state == Candidate && args.Term >= rf.CurrentTerm {
+		rf.convertToFollower(args.Term)
+	}
+
+	// Since this AppendEntries RPC comes from the current leader, we want to reset our
+	// election alarm.
 	Debug(rf, dTimer, "Resetting ELA for T:%d", args.Term)
 	rf.electionAlarm = initElectionAlarm()
 }
@@ -457,7 +480,7 @@ func (rf *Raft) ticker() {
 				sleepDuration = time.Until(rf.electionAlarm)
 
 				// 4. Send RequestVote RPCs to all other servers
-				requestVoteArgs := &RequestVoteArgs{
+				args := &RequestVoteArgs{
 					Term:         rf.CurrentTerm,
 					CandidateId:  rf.me,
 					LastLogIndex: rf.Log[len(rf.Log)-1].Index,
@@ -469,12 +492,11 @@ func (rf *Raft) ticker() {
 				pollingStation := make(chan bool)
 				for server := range rf.peers {
 					if server != rf.me {
-						go rf.requestVote(server, requestVoteArgs, pollingStation)
+						go rf.requestVote(server, args, pollingStation)
 					}
 				}
 
-				// Should this run in a go-routine?
-				go rf.tallyVotes(requestVoteArgs.Term, pollingStation)
+				go rf.tallyVotes(args.Term, pollingStation)
 			}
 		} else if rf.state == Leader {
 			rf.electionAlarm = initElectionAlarm()
