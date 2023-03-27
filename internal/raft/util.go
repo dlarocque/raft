@@ -21,6 +21,14 @@ const (
 
 type state string
 
+func min(a, b int) int {
+	if a > b {
+		return b
+	} else {
+		return a
+	}
+}
+
 // Return a randomly initialized election time
 func initElectionAlarm() time.Time {
 	ms := rand.Intn(maxElectionTimeout-minElectionTimeout) + minElectionTimeout
