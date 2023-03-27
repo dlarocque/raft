@@ -442,7 +442,7 @@ func (rf *Raft) appendEntries(server int, term int) {
 
 					// If a majority of servers have replicated the entry in their logs, we
 					// can safely commit it.
-					if cnt > len(rf.peers)/2+1 {
+					if cnt >= len(rf.peers)/2+1 {
 						Debug(rf, dCommit, "log entry %d was replicated on a majority of followers, updating CI: %d -> %d", N, rf.commitIndex, N)
 						rf.commitIndex = N
 						updatedCommitIndex = true
