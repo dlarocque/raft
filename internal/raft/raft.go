@@ -468,7 +468,9 @@ func (rf *Raft) appendEntries(server int, term int) {
 
 				// Since we have a new entry that we can commit, trigger it.
 				if updatedCommitIndex {
-					rf.commitTrigger <- true
+					go func() {
+						rf.commitTrigger <- true
+					}()
 				}
 			} else {
 				rf.nextIndex[server] -= 1
@@ -561,7 +563,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		Debug(rf, dCommit, "Updated commitIndex to %d", args.LeaderCommit)
 		rf.commitIndex = min(args.LeaderCommit, rf.Log[len(rf.Log)-1].Index)
-		rf.commitTrigger <- true
+		go func() {
+			rf.commitTrigger <- true
+		}()
 	}
 
 	// Since this AppendEntries RPC comes from the current leader, we want to reset our
