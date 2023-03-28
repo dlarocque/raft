@@ -131,12 +131,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// If votedFor is null or candidateId, and candidate's log is at least as
 	// up to date as receiver's log, grant a vote
-	if rf.VotedFor == nullVote || rf.VotedFor == args.CandidateId && rf.logIsMoreUpToDate(args.LastLogIndex, args.LastLogTerm) {
+	if (rf.VotedFor == nullVote || rf.VotedFor == args.CandidateId) && rf.logIsMoreUpToDate(args.LastLogIndex, args.LastLogTerm) {
 		Debug(rf, dVote, "<- S%d sent vote", args.CandidateId)
+		Debug(rf, dInfo, "logIsMoreUpToDate: %v, LLI: %v, LLT: %v, Log: %v", rf.logIsMoreUpToDate(args.LastLogIndex, args.LastLogTerm), args.LastLogIndex, args.LastLogTerm, rf.Log)
 		reply.VoteGranted = true
 		rf.VotedFor = args.CandidateId
 		// Reset election timer when we grand our vote to a peer
-		Debug(rf, dVote, "<- S%d reset election time", args.CandidateId)
+		Debug(rf, dTerm, "Reset ELA")
 		rf.electionAlarm = initElectionAlarm()
 	}
 }
@@ -210,7 +211,7 @@ func (rf *Raft) sendRequestVote(
 	args *RequestVoteArgs,
 	reply *RequestVoteReply,
 ) bool {
-	Debug(rf, dVote, "T%d -> S%d Sending Request Vote, LLI: %d, LLT: %d", args.Term, server, args.LastLogIndex, args.LastLogTerm)
+	Debug(rf, dVote, "-> S%d Sending Request Vote, for T%d, LLI: %d, LLT: %d", server, args.Term, args.LastLogIndex, args.LastLogTerm)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
@@ -245,8 +246,10 @@ func (rf *Raft) tallyVotes(term int, pollingStation <-chan bool) {
 				lastLogEntry := rf.Log[len(rf.Log)-1]
 				rf.nextIndex = make([]int, len(rf.peers))
 				for i := range rf.nextIndex {
-					rf.nextIndex[i] = lastLogEntry.Index + 1
+					rf.nextIndex[i] = lastLogEntry.Index + 1 // Going to be incorrect for some servers
 				}
+				Debug(rf, dInfo, "Leader's log: %v", rf.Log)
+				Debug(rf, dInfo, "Initialized nextIndex = %v\n", rf.nextIndex)
 
 				rf.matchIndex = make([]int, len(rf.peers))
 				for i := range rf.matchIndex {
@@ -273,23 +276,26 @@ func (rf *Raft) tallyVotes(term int, pollingStation <-chan bool) {
 	}
 }
 
-// Returns treu if the log with lastLogIndex and lastLogTerm is more up to
+// Returns true if the log with lastLogIndex and lastLogTerm is more up to
 // date than our log.
 // Assumes the mutex is held.
 func (rf *Raft) logIsMoreUpToDate(lastLogIndex, lastLogTerm int) bool {
 	// The other log is more up to date if its last log entry term is greater
 	// than our last log entry term.
 	lastLogEntry := rf.Log[len(rf.Log)-1]
-	if lastLogEntry.Term > lastLogTerm {
-		return false
-	} else if lastLogEntry.Term < lastLogTerm {
+
+	if lastLogTerm > lastLogEntry.Term {
 		return true
+	} else if lastLogTerm < lastLogEntry.Term {
+		return false
 	}
 
-	// If the last log entry terms are equal, the last log entry
-	// with the highest index belongs to the log that is the most up to date
-	return lastLogEntry.Index <= lastLogIndex
-
+	// Last term is the same, so let's compare indices
+	if lastLogIndex >= lastLogEntry.Index { // If the indices are the same, we'll just say the other is more up to date
+		return true
+	} else {
+		return false
+	}
 }
 
 // Transition to the follower state, and enter the most recent term.
@@ -346,6 +352,8 @@ func (rf *Raft) sendHeartbeat(server int, term int) {
 	}
 
 	// prevLogIndex is the index where the leader and the followers' logs are in agreement
+	Debug(rf, dInfo, "nextIndex: %v", rf.nextIndex)
+
 	prevLogIndex := rf.nextIndex[server] - 1 // Index of log entry immediately preceeding new ones
 	args := &AppendEntriesArgs{
 		Term:         rf.CurrentTerm,
@@ -367,8 +375,10 @@ func (rf *Raft) sendHeartbeat(server int, term int) {
 		// then it must be the case that another leader has established itself,
 		// so we must follow it since it is from a more recent term.
 		if reply.Term > rf.CurrentTerm {
-			Debug(rf, dTerm, "<- S%d at T%d is more up to date", server, reply.Term)
+			Debug(rf, dTerm, "<- S%d at T%d has a higher term, stepping down", server, reply.Term)
 			rf.convertToFollower(reply.Term)
+			Debug(rf, dTerm, "Reset ELA")
+			rf.electionAlarm = initElectionAlarm()
 		}
 
 		rf.mu.Unlock()
@@ -394,6 +404,8 @@ func (rf *Raft) appendEntries(server int, term int) {
 		entries = rf.Log[rf.nextIndex[server]:]
 	}
 
+	Debug(rf, dInfo, "nextIndex: %v", rf.nextIndex)
+
 	// prevLogIndex can be seen as the index where the leader and the followers' logs agree
 	prevLogIndex := rf.nextIndex[server] - 1 // Index of log entry immediately preceeding new ones
 	args := &AppendEntriesArgs{
@@ -405,16 +417,22 @@ func (rf *Raft) appendEntries(server int, term int) {
 		LeaderCommit: rf.commitIndex,
 	}
 
+	Debug(rf, dLog, "-> S%d: Sending AE with PLI: %d, PLT: %d", server, args.PrevLogIndex, args.PrevLogTerm)
+
 	rf.mu.Unlock()
 
 	reply := &AppendEntriesReply{}
 	ok := rf.sendAppendEntries(server, args, reply)
+
 	if ok {
 		rf.mu.Lock()
+
+		Debug(rf, dLog, "-> S%d: AE Replied, Success: %v, T: %v", server, reply.Success, reply.Term)
 
 		if reply.Term > rf.CurrentTerm {
 			Debug(rf, dTerm, "<- S%d at T%d is more up to date", server, reply.Term)
 			rf.convertToFollower(reply.Term)
+			rf.electionAlarm = initElectionAlarm()
 		}
 
 		// Validate state
@@ -422,7 +440,6 @@ func (rf *Raft) appendEntries(server int, term int) {
 			// If successful, update nextIndex and matchIndex for follower
 			// If Append Entries fails because of log inconsistency, decrement nextIndex and retry
 			if reply.Success {
-				Debug(rf, dLog, "-> S%d: AppendEntries succeeded", server)
 				rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
 				rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 
@@ -443,7 +460,7 @@ func (rf *Raft) appendEntries(server int, term int) {
 					// If a majority of servers have replicated the entry in their logs, we
 					// can safely commit it.
 					if cnt >= len(rf.peers)/2+1 {
-						Debug(rf, dCommit, "log entry %d was replicated on a majority of followers, updating CI: %d -> %d", N, rf.commitIndex, N)
+						Debug(rf, dCommit, "Log entry %d was replicated on a majority of followers, updating CI: %d -> %d", N, rf.commitIndex, N)
 						rf.commitIndex = N
 						updatedCommitIndex = true
 					}
@@ -455,7 +472,7 @@ func (rf *Raft) appendEntries(server int, term int) {
 				}
 			} else {
 				rf.nextIndex[server] -= 1
-				Debug(rf, dLog, "-> S%d: AppendEntries RPC failed, decrementing nextIndex and retrying", server)
+				Debug(rf, dLog, "-> S%d: Decrementing nextIndex and retrying", server)
 				go rf.appendEntries(server, term) // FIXME: Should we release the lock before retrying?
 			}
 		}
@@ -470,7 +487,7 @@ func (rf *Raft) sendAppendEntries(
 	args *AppendEntriesArgs,
 	reply *AppendEntriesReply,
 ) bool {
-	Debug(rf, dLog2, "-> S%d, Sending AppendEntries for T%d", server, args.Term)
+	Debug(rf, dLog2, "-> S%d, Sending AE for T%d, PLI: %d, PLT: %d", server, args.Term, args.PrevLogIndex, args.PrevLogTerm)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -482,7 +499,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	Debug(rf, dLog, "<- S%d: T%d Received AppendEntries", args.LeaderId, args.Term)
+	Debug(rf, dLog, "<- S%d: T%d Received AE, PLI: %d, PLT: %d", args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm)
 
 	reply.Term = rf.CurrentTerm
 	reply.Success = false
@@ -497,12 +514,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	// If Append Entries received from server with term greater than ours, convert to follower.
+	if args.Term > rf.CurrentTerm {
+		Debug(rf, dLog, "T%d < T%d, converting to follower for T%d", args.LeaderId, args.Term, rf.CurrentTerm, args.Term)
+		rf.convertToFollower(args.Term)
+	}
+
 	// Reply false if log doesn't contain an entry at prevLogIndex whose term
 	// matches prevLogTerm.  This rejects Append Entries from stale leaders.
-	if rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	Debug(rf, dInfo, "PLI: %v, log len: %v", args.PrevLogTerm, len(rf.Log))
+	if args.PrevLogIndex >= len(rf.Log) || rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		Debug(rf, dLog, "<- S%d: Replying false since log doesn't contain entry at PLI:%d whose term matches PLT:%d", args.LeaderId, args.PrevLogIndex, args.PrevLogTerm)
-		Debug(rf, dLog, "log[%d].Term = %d", args.PrevLogIndex, rf.Log[args.PrevLogIndex].Term)
-		Debug(rf, dLog, "Current log: %v", rf.Log)
 		return
 	}
 
@@ -513,12 +535,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// If an existing entry conflicts with a new one, delete the existing entry and
 	// all that follow it.
 	i := 0
+	Debug(rf, dInfo, "Log[PLI+1:]: %v, Entries: %v", rf.Log[args.PrevLogIndex+1+i:], args.Entries)
 	for i = 0; i < len(args.Entries); i++ {
 		if args.PrevLogIndex+1+i > len(rf.Log)-1 {
 			Debug(rf, dLog, "<- S%d: no log conflicts", args.LeaderId)
 			break
 		} else if rf.Log[args.PrevLogIndex+1+i].Term != args.Entries[i].Term {
-			Debug(rf, dLog, "deleted conflicting entries: %v", rf.Log[args.PrevLogIndex+1+i:])
+			Debug(rf, dLog, "Log: %v", rf.Log)
+			Debug(rf, dLog, "PLI: %v, PLT: %v, Entries: %v", args.PrevLogIndex, args.PrevLogTerm, args.Entries)
+			Debug(rf, dLog, "Deleted conflicting entries: %v", rf.Log[args.PrevLogIndex+1+i:])
 			rf.Log = rf.Log[:args.PrevLogIndex+1+i]
 			break
 		}
@@ -537,12 +562,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		Debug(rf, dCommit, "Updated commitIndex to %d", args.LeaderCommit)
 		rf.commitIndex = min(args.LeaderCommit, rf.Log[len(rf.Log)-1].Index)
 		rf.commitTrigger <- true
-	}
-
-	// If Append Entries received from server with term greater than ours, convert to follower.
-	if args.Term > rf.CurrentTerm {
-		Debug(rf, dLog, "T%d < T%d, converting to follower for T%d", args.LeaderId, args.Term, rf.CurrentTerm, args.Term)
-		rf.convertToFollower(args.Term)
 	}
 
 	// Since this AppendEntries RPC comes from the current leader, we want to reset our
