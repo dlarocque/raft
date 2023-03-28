@@ -320,8 +320,7 @@ func (rf *Raft) pacemaker(term int) {
 			Debug(rf, dLeader, "pacemaker sending heartbeats, T%d", term)
 			for i := range rf.peers {
 				if i != rf.me {
-					go rf.sendHeartbeat(i, term)
-					// go rf.appendEntries(i, term)
+					go rf.appendEntries(i, term)
 				}
 			}
 
@@ -333,55 +332,6 @@ func (rf *Raft) pacemaker(term int) {
 			rf.mu.Unlock()
 			return
 		}
-	}
-}
-
-// goroutine that sends heartbeats (empty Append Entries RPCs).
-// Leaders periodically send out heartbeats to prevent followers' election alarms
-// from expiring, and starting a new election. Heartbeats allow a leader to remain
-// the leader until they die, or the network is partitioned such that the leader no
-// longer is able to send heartbeats to a majority of servers.  In this case, another
-// leader may arise if it is able to gain a majority in an election, or the raft service
-// will temporarily refuse requests until a leader is able to be established.
-func (rf *Raft) sendHeartbeat(server int, term int) {
-	rf.mu.Lock()
-	// Validate that we are still the leader for the current term.
-	if rf.state != Leader || rf.CurrentTerm != term {
-		rf.mu.Unlock()
-		return
-	}
-
-	// prevLogIndex is the index where the leader and the followers' logs are in agreement
-	Debug(rf, dInfo, "nextIndex: %v", rf.nextIndex)
-
-	prevLogIndex := rf.nextIndex[server] - 1 // Index of log entry immediately preceeding new ones
-	args := &AppendEntriesArgs{
-		Term:         rf.CurrentTerm,
-		LeaderId:     rf.me,
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  rf.Log[prevLogIndex].Term,
-		Entries:      []LogEntry{},
-		LeaderCommit: rf.commitIndex,
-	}
-
-	rf.mu.Unlock()
-
-	reply := &AppendEntriesReply{}
-	ok := rf.sendAppendEntries(server, args, reply)
-	if ok {
-		rf.mu.Lock()
-
-		// If we sent a heartbeat to a server that has a higher term then us,
-		// then it must be the case that another leader has established itself,
-		// so we must follow it since it is from a more recent term.
-		if reply.Term > rf.CurrentTerm {
-			Debug(rf, dTerm, "<- S%d at T%d has a higher term, stepping down", server, reply.Term)
-			rf.convertToFollower(reply.Term)
-			Debug(rf, dTerm, "Reset ELA")
-			rf.electionAlarm = initElectionAlarm()
-		}
-
-		rf.mu.Unlock()
 	}
 }
 
@@ -433,6 +383,7 @@ func (rf *Raft) appendEntries(server int, term int) {
 			Debug(rf, dTerm, "<- S%d at T%d is more up to date", server, reply.Term)
 			rf.convertToFollower(reply.Term)
 			rf.electionAlarm = initElectionAlarm()
+			// Converting to follower here prevents us from updating nextIndex in the future
 		}
 
 		// Validate state
@@ -455,14 +406,14 @@ func (rf *Raft) appendEntries(server int, term int) {
 								cnt += 1
 							}
 						}
-					}
 
-					// If a majority of servers have replicated the entry in their logs, we
-					// can safely commit it.
-					if cnt >= len(rf.peers)/2+1 {
-						Debug(rf, dCommit, "Log entry %d was replicated on a majority of followers, updating CI: %d -> %d", N, rf.commitIndex, N)
-						rf.commitIndex = N
-						updatedCommitIndex = true
+						// If a majority of servers have replicated the entry in their logs, we
+						// can safely commit it.
+						if cnt >= len(rf.peers)/2+1 {
+							Debug(rf, dCommit, "Log entry %d was replicated on a majority of followers, updating CI: %d -> %d", N, rf.commitIndex, N)
+							rf.commitIndex = N
+							updatedCommitIndex = true
+						}
 					}
 				}
 
@@ -516,12 +467,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// If Append Entries received from server with term greater than ours, convert to follower.
-	if args.Term > rf.CurrentTerm {
-		Debug(rf, dLog, "T%d < T%d, converting to follower for T%d", args.LeaderId, args.Term, rf.CurrentTerm, args.Term)
-		rf.convertToFollower(args.Term)
-	}
-
 	// Reply false if log doesn't contain an entry at prevLogIndex whose term
 	// matches prevLogTerm.  This rejects Append Entries from stale leaders.
 	Debug(rf, dInfo, "PLI: %v, log len: %v", args.PrevLogTerm, len(rf.Log))
@@ -536,6 +481,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// If an existing entry conflicts with a new one, delete the existing entry and
 	// all that follow it.
+
 	i := 0
 	Debug(rf, dInfo, "Log[PLI+1:]: %v, Entries: %v", rf.Log[args.PrevLogIndex+1+i:], args.Entries)
 	for i = 0; i < len(args.Entries); i++ {
