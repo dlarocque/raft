@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"raft/internal/gob"
 	"raft/internal/rpc"
 	"sync"
 	"sync/atomic"
@@ -136,6 +138,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		Debug(rf, dInfo, "logIsMoreUpToDate: %v, LLI: %v, LLT: %v, Log: %v", rf.logIsMoreUpToDate(args.LastLogIndex, args.LastLogTerm), args.LastLogIndex, args.LastLogTerm, rf.Log)
 		reply.VoteGranted = true
 		rf.VotedFor = args.CandidateId
+		rf.persist()
 		// Reset election timer when we grand our vote to a peer
 		Debug(rf, dTerm, "Reset ELA")
 		rf.electionAlarm = initElectionAlarm()
@@ -305,6 +308,7 @@ func (rf *Raft) convertToFollower(term int) {
 	rf.VotedFor = nullVote
 	rf.nextIndex = nil
 	rf.matchIndex = nil
+	rf.persist()
 	Debug(rf, dTerm, "converted to follower for T%d", term)
 }
 
@@ -391,8 +395,8 @@ func (rf *Raft) appendEntries(server int, term int) {
 			// If successful, update nextIndex and matchIndex for follower
 			// If Append Entries fails because of log inconsistency, decrement nextIndex and retry
 			if reply.Success {
-				rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
-				rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+				rf.nextIndex[server] = max(args.PrevLogIndex+len(args.Entries)+1, rf.nextIndex[server])
+				rf.matchIndex[server] = max(args.PrevLogIndex+len(args.Entries), rf.matchIndex[server])
 
 				// Update commitIndex
 				// If there exists N such that N > commitIndex, a majority of matchIndex[i] >= N,
@@ -483,6 +487,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// all that follow it.
 
 	i := 0
+	modifiedLog := false
 	Debug(rf, dInfo, "Log[PLI+1:]: %v, Entries: %v", rf.Log[args.PrevLogIndex+1+i:], args.Entries)
 	for i = 0; i < len(args.Entries); i++ {
 		if args.PrevLogIndex+1+i > len(rf.Log)-1 {
@@ -493,6 +498,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			Debug(rf, dLog, "PLI: %v, PLT: %v, Entries: %v", args.PrevLogIndex, args.PrevLogTerm, args.Entries)
 			Debug(rf, dLog, "Deleted conflicting entries: %v", rf.Log[args.PrevLogIndex+1+i:])
 			rf.Log = rf.Log[:args.PrevLogIndex+1+i]
+			modifiedLog = true
 			break
 		}
 	}
@@ -501,6 +507,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if i < len(args.Entries) {
 		Debug(rf, dLog, "appending entries: %v", args.Entries[i:])
 		rf.Log = append(rf.Log, args.Entries[i:]...)
+		modifiedLog = true
+	}
+
+	if modifiedLog {
+		rf.persist()
 	}
 
 	Debug(rf, dLog, "updated log: %v", rf.Log)
@@ -583,10 +594,12 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 		Command: command,
 	})
 
+	rf.persist()
+
 	rf.nextIndex[rf.me] += 1
 	rf.matchIndex[rf.me] = index
 
-	Debug(rf, dLog, "Received new operation, NI: %d, MI: %d", rf.nextIndex, rf.matchIndex)
+	Debug(rf, dLog, "Received new operation (%v), NI: %d, MI: %d", command, rf.nextIndex, rf.matchIndex)
 	Debug(rf, dLog2, "Current log: %v", rf.Log)
 
 	rf.mu.Unlock()
@@ -640,6 +653,7 @@ func (rf *Raft) ticker() {
 
 				// 2. Vote for self
 				rf.VotedFor = rf.me
+				rf.persist()
 
 				// 3. Reset election timer
 				rf.electionAlarm = initElectionAlarm()
@@ -712,7 +726,11 @@ func Make(
 		matchIndex: nil,
 	}
 
-	Debug(rf, dClient, "Started at T%d, ET %d", rf.CurrentTerm, rf.electionAlarm.UnixMilli()-time.Now().UnixMilli())
+	data := rf.persister.ReadRaftState()
+	Debug(rf, dPersist, "Restored data: %v", data)
+	rf.readPersist(data)
+
+	Debug(rf, dClient, "Started at T%d, ET %d, ", rf.CurrentTerm, rf.electionAlarm.UnixMilli()-time.Now().UnixMilli())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
@@ -731,32 +749,38 @@ func Make(
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+
+	// Encode all objects that should be persistent
+	if e.Encode(rf.CurrentTerm) != nil || e.Encode(rf.VotedFor) != nil || e.Encode(rf.Log) != nil {
+		Debug(rf, dError, "Failed to encode raft state")
+	} else {
+		raftstate := w.Bytes()
+		rf.persister.Save(raftstate, nil)
+		Debug(rf, dPersist, "Saved raft state: %v", rf.persister.ReadRaftState())
+	}
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+		Debug(rf, dPersist, "data is nil or length < 1: %v", data)
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	var CurrentTerm, VotedFor int
+	var Log []LogEntry
+
+	if d.Decode(&CurrentTerm) != nil ||
+		d.Decode(&VotedFor) != nil ||
+		d.Decode(&Log) != nil {
+		Debug(rf, dError, "Failed to decode Raft state")
+	} else {
+		rf.CurrentTerm = CurrentTerm
+		rf.VotedFor = VotedFor
+		rf.Log = Log
+		Debug(rf, dPersist, "Restored raft state, T%d, VF: %d, Log: %v", rf.CurrentTerm, rf.VotedFor, rf.Log)
+	}
 }
