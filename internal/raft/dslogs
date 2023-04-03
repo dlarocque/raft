@@ -107,10 +107,6 @@ def main(
                 cols = Columns(cols, width=col_width - 1, equal=True, expand=True)
                 print(cols)
         except Exception as e:
-            print("unexpected format:", line)
-            print("exception: ", e)
-            print("cols: ", cols)
-            return
             if line.startswith("panic"):
                 panic = True
             # Output from tests is usually important so add a
