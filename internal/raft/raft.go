@@ -94,6 +94,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // Current term, in case the leader needs to update itself
 	Success bool // True if follower contained an entry matching log entry and index
+
+	ConflictTerm  int // Term of the log entry that conflicts with the leaders'
+	ConflictIndex int // Index of the log entry that conflicts with the leaders'
+	LogLength     int
 }
 
 // return currentTerm and whether this server
@@ -428,9 +432,30 @@ func (rf *Raft) appendEntries(server int, term int) {
 					}()
 				}
 			} else {
-				rf.nextIndex[server] -= 1
-				Debug(rf, dLog, "-> S%d: Decrementing nextIndex and retrying", server)
-				go rf.appendEntries(server, term) // FIXME: Should we release the lock before retrying?
+				// Optimization discussed at bottom of page 7 in the paper, that only makes it
+				// so that we have to retry an Append Entries RPC once, rather than once for every
+				// conflicting index.
+				// If the followers log is behind on entries, simply update nextIndex
+				// to be the next index in the log.  If there is a log entry with a conflicting
+				// term in the followers log, update nextIndex to be the index of the term that
+				// conflicts with the leaders'.
+				// This is required to pass the last few tests of 2C since the logs are so large.
+				if reply.LogLength != 0 && reply.ConflictTerm == 0 {
+					rf.nextIndex[server] = reply.LogLength
+				} else {
+					for i := len(rf.Log) - 1; i >= 0; i-- {
+						if rf.Log[i].Term == reply.ConflictTerm {
+							rf.nextIndex[server] = rf.Log[i].Index + 1
+							break
+						}
+						if rf.Log[i].Term < reply.ConflictTerm {
+							rf.nextIndex[server] = reply.ConflictIndex
+							break
+						}
+					}
+				}
+
+				go rf.appendEntries(server, term)
 			}
 		}
 
@@ -479,13 +504,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	// Log restoration optimization
+	if args.PrevLogIndex >= len(rf.Log) {
+		reply.LogLength = rf.Log[len(rf.Log)-1].Index + 1
+		return
+	}
+
+	prevLogEntry := rf.Log[args.PrevLogIndex]
+	if args.PrevLogTerm != prevLogEntry.Term {
+		reply.ConflictTerm = prevLogEntry.Term
+		for i := args.PrevLogIndex; i >= 0; i-- {
+			reply.ConflictIndex = rf.Log[i].Index
+			if rf.Log[i].Term != prevLogEntry.Term {
+				break
+			}
+		}
+
+		return
+	}
+
 	// We now know that this leader is up to date, so this RPC is going to be
 	// successful.  We now just want to replicate its log.
 	reply.Success = true
 
 	// If an existing entry conflicts with a new one, delete the existing entry and
 	// all that follow it.
-
 	i := 0
 	modifiedLog := false
 	Debug(rf, dInfo, "Log[PLI+1:]: %v, Entries: %v", rf.Log[args.PrevLogIndex+1+i:], args.Entries)
